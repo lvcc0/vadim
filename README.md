@@ -6,4 +6,4 @@
 * *{**V**ulkan, **V**isual} **A**nalysis of **D**ynamics in **I**nteratomic **M**edia*
 
 ## VADIM's powers
-he can draw triangle
+he can draw rectangle
