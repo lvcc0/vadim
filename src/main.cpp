@@ -67,16 +67,21 @@ private:
     std::vector<vk::raii::Fence>     inFlightFences;
     uint32_t                         frameIndex = 0;
 
+    bool framebufferResized = false;
+
     std::vector<const char*> requiredDeviceExtensions = {vk::KHRSwapchainExtensionName};
 
     void initWindow()
     {
         glfwInit();
 
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); // don't create opengl context
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE); // for now
+        // don't create opengl context
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
         this->window = glfwCreateWindow(640, 480, "VADIM", nullptr, nullptr);
+        
+        glfwSetWindowUserPointer(this->window, this);
+        glfwSetFramebufferSizeCallback(this->window, this->framebufferResizedCallback);
     }
 
     void initVulkan()
@@ -116,9 +121,19 @@ private:
 
         auto [result, imageIndex] = this->swapChain.acquireNextImage(UINT64_MAX, *this->presentCompleteSemaphores[frameIndex], nullptr);
 
-        this->recordCommandBuffer(imageIndex);
+        if (result == vk::Result::eErrorOutOfDateKHR)
+        {
+            this->recreateSwapChain();
+            return;
+        }
 
-        this->queue.waitIdle();
+        if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
+            throw std::runtime_error("failed to acquire swap chain image");
+
+        this->device.resetFences(*this->inFlightFences[frameIndex]);
+
+        this->commandBuffers[frameIndex].reset();
+        this->recordCommandBuffer(imageIndex);
 
         vk::PipelineStageFlags waitDestionationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
         const vk::SubmitInfo submitInfo{
@@ -128,14 +143,14 @@ private:
             .commandBufferCount   = 1,
             .pCommandBuffers      = &*this->commandBuffers[frameIndex],
             .signalSemaphoreCount = 1,
-            .pSignalSemaphores    = &*this->renderFinishedSemaphores[frameIndex]
+            .pSignalSemaphores    = &*this->renderFinishedSemaphores[imageIndex]
         };
 
         this->queue.submit(submitInfo, *this->inFlightFences[frameIndex]);
 
         const vk::PresentInfoKHR presentInfoKHR{
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores    = &*this->renderFinishedSemaphores[frameIndex],
+            .pWaitSemaphores    = &*this->renderFinishedSemaphores[imageIndex],
             .swapchainCount     = 1,
             .pSwapchains        = &*this->swapChain,
             .pImageIndices      = &imageIndex
@@ -148,8 +163,10 @@ private:
         case vk::Result::eSuccess:
             break;
         
+        case vk::Result::eErrorOutOfDateKHR:
         case vk::Result::eSuboptimalKHR:
-            std::cout << "suboptimal result\n";
+            this->framebufferResized = false;
+            this->recreateSwapChain();
             break;
         
         default:
@@ -161,8 +178,16 @@ private:
 
     void cleanup()
     {
+        this->cleanupSwapChain();
+
         glfwDestroyWindow(this->window);
         glfwTerminate();
+    }
+
+    static void framebufferResizedCallback(GLFWwindow* window, int width, int height)
+    {
+        auto app = reinterpret_cast<VadimApp*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 
     void createInstance()
@@ -443,6 +468,30 @@ private:
             std::clamp<uint32_t>(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
             std::clamp<uint32_t>(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
         };
+    }
+
+    void recreateSwapChain()
+    {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(this->window, &width, &height);
+
+        while (width == 0 || height == 0)
+        {
+            glfwGetFramebufferSize(this->window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        this->device.waitIdle();
+
+        this->cleanupSwapChain();
+        this->createSwapChain();
+        this->createImageViews();
+    }
+
+    void cleanupSwapChain()
+    {
+        this->swapChainImageViews.clear();
+        this->swapChain = nullptr;
     }
 
     void createImageViews()
