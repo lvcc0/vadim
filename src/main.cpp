@@ -6,29 +6,46 @@
 #include <map>
 
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
 #include <cstdint>
+#include <limits>
+#include <chrono>
 
+// Vulkan
 #include <vulkan/vulkan_raii.hpp>
-#include <GLFW/glfw3.h>
+
+// GLM
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
-constexpr uint32_t WIDTH = 600;
-constexpr uint32_t HEIGHT = 400;
+// GLFW
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
 
-constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+#ifdef NDEBUG
+constexpr bool ENABLE_VALIDATION_LAYERS = false;
+#else
+constexpr bool ENABLE_VALIDATION_LAYERS = true;
+#endif
 
-const std::vector<char const*> validationLayers =
-{
+const std::vector<char const*> VALIDATION_LAYERS = {
     "VK_LAYER_KHRONOS_validation"
 };
 
-#ifdef NDEBUG
-constexpr bool enableValidationLayers = false;
-#else
-constexpr bool enableValidationLayers = true;
-#endif
+constexpr uint32_t WIDTH  = 800;
+constexpr uint32_t HEIGHT = 600;
+
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
+struct UniformBufferObject
+{
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
 
 struct Vertex
 {
@@ -37,8 +54,7 @@ struct Vertex
 
     static vk::VertexInputBindingDescription getBindingDescription()
     {
-        return
-        {
+        return {
             .binding   = 0,
             .stride    = sizeof(Vertex),
             .inputRate = vk::VertexInputRate::eVertex
@@ -47,25 +63,22 @@ struct Vertex
 
     static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions()
     {
-        return 
-        {{
+        return {{
             { .location = 0, .binding = 0, .format = vk::Format::eR32G32Sfloat,    .offset = offsetof(Vertex, pos)   },
             { .location = 1, .binding = 0, .format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, color) }
         }};
     }
 };
 
-const std::vector<Vertex> vertices =
-{
+const std::vector<Vertex> vertices = {
     {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
     {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
     {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}},
     {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}}
 };
 
-const std::vector<uint16_t> indices =
-{
-    0, 1, 2, 2, 3, 0
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0,
 };
 
 class VadimApp
@@ -98,13 +111,21 @@ private:
     vk::Extent2D                     swapChainExtent;
     std::vector<vk::raii::ImageView> swapChainImageViews;
 
-    vk::raii::PipelineLayout pipelineLayout   = nullptr;
-    vk::raii::Pipeline       graphicsPipeline = nullptr;
+    vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
+    vk::raii::PipelineLayout      pipelineLayout      = nullptr;
+    vk::raii::Pipeline            graphicsPipeline    = nullptr;
 
     vk::raii::Buffer       vertexBuffer       = nullptr;
     vk::raii::DeviceMemory vertexBufferMemory = nullptr;
     vk::raii::Buffer       indexBuffer        = nullptr;
     vk::raii::DeviceMemory indexBufferMemory  = nullptr;
+
+    std::vector<vk::raii::Buffer>       uniformBuffers;
+    std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
+    std::vector<void*>                  uniformBuffersMapped;
+
+    vk::raii::DescriptorPool             descriptorPool = nullptr;
+    std::vector<vk::raii::DescriptorSet> descriptorSets;
 
     vk::raii::CommandPool                commandPool = nullptr;
     std::vector<vk::raii::CommandBuffer> commandBuffers;
@@ -116,7 +137,9 @@ private:
 
     bool framebufferResized = false;
 
-    std::vector<const char*> requiredDeviceExtensions = {vk::KHRSwapchainExtensionName};
+    std::vector<const char*> requiredDeviceExtensions = {
+        vk::KHRSwapchainExtensionName
+    };
 
     void initWindow()
     {
@@ -125,7 +148,7 @@ private:
         // don't create opengl context
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
-        this->window = glfwCreateWindow(640, 480, "VADIM", nullptr, nullptr);
+        this->window = glfwCreateWindow(WIDTH, HEIGHT, "VADIM", nullptr, nullptr);
         
         glfwSetWindowUserPointer(this->window, this);
         glfwSetFramebufferSizeCallback(this->window, this->framebufferResizedCallback);
@@ -140,10 +163,14 @@ private:
         this->createLogicalDevice();
         this->createSwapChain();
         this->createImageViews();
+        this->createDescriptorSetLayout();
         this->createGraphicsPipeline();
         this->createCommandPool();
         this->createVertexBuffer();
         this->createIndexBuffer();
+        this->createUniformBuffers();
+        this->createDescriptorPool();
+        this->createDescriptorSets();
         this->createCommandBuffers();
         this->createSyncObjects();
     }
@@ -161,14 +188,22 @@ private:
 
     void drawFrame()
     {
-        vk::Result fenceResult = this->device.waitForFences(*this->inFlightFences[frameIndex], vk::True, UINT64_MAX);
+        vk::Result fenceResult = this->device.waitForFences(
+            *this->inFlightFences[frameIndex],
+            vk::True,
+            UINT64_MAX
+        );
     
         if (fenceResult != vk::Result::eSuccess)
             throw std::runtime_error("failed to wait for fence");
         
         this->device.resetFences(*this->inFlightFences[frameIndex]);
 
-        auto [result, imageIndex] = this->swapChain.acquireNextImage(UINT64_MAX, *this->presentCompleteSemaphores[frameIndex], nullptr);
+        auto [result, imageIndex] = this->swapChain.acquireNextImage(
+            UINT64_MAX,
+            *this->presentCompleteSemaphores[frameIndex],
+            nullptr
+        );
 
         if (result == vk::Result::eErrorOutOfDateKHR)
         {
@@ -178,6 +213,8 @@ private:
 
         if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
             throw std::runtime_error("failed to acquire swap chain image");
+
+        this->updateUniformBuffer(frameIndex);
 
         this->device.resetFences(*this->inFlightFences[frameIndex]);
 
@@ -233,12 +270,6 @@ private:
         glfwTerminate();
     }
 
-    static void framebufferResizedCallback(GLFWwindow* window, int width, int height)
-    {
-        auto app = reinterpret_cast<VadimApp*>(glfwGetWindowUserPointer(window));
-        app->framebufferResized = true;
-    }
-
     void createInstance()
     {
         constexpr vk::ApplicationInfo appInfo{
@@ -252,7 +283,7 @@ private:
         // check for validation layers (DEBUG)
 
         std::vector<const char*> requiredLayers;
-        if (enableValidationLayers) requiredLayers.assign(validationLayers.begin(), validationLayers.end());
+        if (ENABLE_VALIDATION_LAYERS) requiredLayers.assign(VALIDATION_LAYERS.begin(), VALIDATION_LAYERS.end());
 
         std::vector<vk::LayerProperties> layerProperties = this->context.enumerateInstanceLayerProperties();
         auto unsupportedLayerIt = std::ranges::find_if(requiredLayers, [&layerProperties](auto const &requiredLayer) {
@@ -293,7 +324,7 @@ private:
 
     void setupDebugMessenger()
     {
-        if (!enableValidationLayers) return;
+        if (!ENABLE_VALIDATION_LAYERS) return;
 
         vk::DebugUtilsMessageSeverityFlagsEXT severityFlags(
             vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
@@ -374,13 +405,14 @@ private:
 
             candidates.insert(std::make_pair(score, pd));
 
-            if (enableValidationLayers)
+            if (ENABLE_VALIDATION_LAYERS)
                 std::cout << deviceProperties.deviceName << ": " << score << std::endl;
         }
 
         if (!candidates.empty() && candidates.rbegin()->first > 0)
         {
-            std::cout << "using " << candidates.rbegin()->second.getProperties().deviceName << std::endl;
+            if (ENABLE_VALIDATION_LAYERS)
+                std::cout << "using " << candidates.rbegin()->second.getProperties().deviceName << std::endl;
 
             this->physicalDevice = candidates.rbegin()->second;
             return;
@@ -406,8 +438,7 @@ private:
         if (this->queueIndex == ~0)
             throw std::runtime_error("could not find a queue for graphics and presenting");
 
-        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain =
-        {
+        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = {
             { // vk::PhysicalDeviceFeatures2
 
             },
@@ -561,6 +592,73 @@ private:
         }
     }
 
+    void createDescriptorSetLayout()
+    {
+        vk::DescriptorSetLayoutBinding uboLayoutBinding{
+            .binding         = 0,
+            .descriptorType  = vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = 1,
+            .stageFlags      = vk::ShaderStageFlagBits::eVertex
+        };
+
+        vk::DescriptorSetLayoutCreateInfo layoutInfo{
+            .bindingCount = 1,
+            .pBindings    = &uboLayoutBinding
+        };
+
+        this->descriptorSetLayout = vk::raii::DescriptorSetLayout(this->device, layoutInfo);
+    }
+
+    void createDescriptorPool()
+    {
+        vk::DescriptorPoolSize poolSize{
+            .type            = vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT
+        };
+
+        vk::DescriptorPoolCreateInfo poolInfo{
+            .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets       = MAX_FRAMES_IN_FLIGHT,
+            .poolSizeCount = 1,
+            .pPoolSizes    = &poolSize
+        };
+
+        this->descriptorPool = vk::raii::DescriptorPool(this->device, poolInfo);
+    }
+
+    void createDescriptorSets()
+    {
+        std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *this->descriptorSetLayout);
+
+        vk::DescriptorSetAllocateInfo allocateInfo{
+            .descriptorPool     = this->descriptorPool,
+            .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
+            .pSetLayouts        = layouts.data()
+        };
+
+        this->descriptorSets = this->device.allocateDescriptorSets(allocateInfo);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            vk::DescriptorBufferInfo bufferInfo{
+                .buffer = this->uniformBuffers[i],
+                .offset = 0,
+                .range = sizeof(UniformBufferObject)
+            };
+
+            vk::WriteDescriptorSet descriptorWrite{
+                .dstSet          = this->descriptorSets[i],
+                .dstBinding      = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eUniformBuffer,
+                .pBufferInfo     = &bufferInfo
+            };
+
+            this->device.updateDescriptorSets(descriptorWrite, {});
+        }
+    }
+
     void createGraphicsPipeline()
     {
         // note: path relative to main.cpp
@@ -604,7 +702,7 @@ private:
             .rasterizerDiscardEnable = vk::False,
             .polygonMode             = vk::PolygonMode::eFill,
             .cullMode                = vk::CullModeFlagBits::eBack,
-            .frontFace               = vk::FrontFace::eClockwise,
+            .frontFace               = vk::FrontFace::eCounterClockwise,
             .depthBiasEnable         = vk::False,
             .lineWidth               = 1.0f
         };
@@ -633,7 +731,8 @@ private:
         };
 
         vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
-            .setLayoutCount = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &*descriptorSetLayout,
             .pushConstantRangeCount = 0
         };
 		
@@ -679,15 +778,14 @@ private:
 
     void createCommandPool()
     {
-        vk::CommandPoolCreateInfo poolInfo
-        {
+        vk::CommandPoolCreateInfo poolInfo{
             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
             .queueFamilyIndex = this->queueIndex
         };
 
         this->commandPool = vk::raii::CommandPool(this->device, poolInfo);
     }
-    
+
     void createVertexBuffer()
     {
         vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
@@ -732,6 +830,41 @@ private:
         );
 
         this->copyBuffer(stagingBuffer, this->indexBuffer, bufferSize);
+    }
+
+    void createUniformBuffers()
+    {
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
+            
+            auto [buffer, bufferMemory] = this->createBuffer(
+                bufferSize,
+                vk::BufferUsageFlagBits::eUniformBuffer,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+            );
+
+            this->uniformBuffers.emplace_back(std::move(buffer));
+            this->uniformBuffersMemory.emplace_back(std::move(bufferMemory));
+            this->uniformBuffersMapped.emplace_back(this->uniformBuffersMemory.back().mapMemory(0, bufferSize));
+        }
+    }
+
+    void updateUniformBuffer(uint32_t currentImage)
+    {
+        static auto startTime = std::chrono::high_resolution_clock::now();
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+    
+        UniformBufferObject ubo{};
+        ubo.model = rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.view  = lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.proj  = glm::perspective(glm::radians(45.0f), static_cast<float>(this->swapChainExtent.width) / static_cast<float>(this->swapChainExtent.height), 0.1f, 10.0f);
+
+        ubo.proj[1][1] *= -1; // flip Y axis (this is not opengl)
+
+        memcpy(this->uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     }
 
     uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties)
@@ -817,8 +950,7 @@ private:
 
         vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
         
-        vk::RenderingAttachmentInfo attachmentInfo = 
-        {
+        vk::RenderingAttachmentInfo attachmentInfo = {
             .imageView   = this->swapChainImageViews[imageIndex],
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
             .loadOp      = vk::AttachmentLoadOp::eClear,
@@ -826,10 +958,8 @@ private:
             .clearValue  = clearColor
         };
 
-        vk::RenderingInfo renderingInfo = 
-        {
-            .renderArea           =
-            {
+        vk::RenderingInfo renderingInfo = {
+            .renderArea           = {
                 .offset = {0, 0},
                 .extent = this->swapChainExtent
             },
@@ -846,6 +976,7 @@ private:
         commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), this->swapChainExtent));
         commandBuffer.bindVertexBuffers(0, *this->vertexBuffer, {0});
         commandBuffer.bindIndexBuffer(*this->indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, this->pipelineLayout, 0, *this->descriptorSets[this->frameIndex], nullptr);
         commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
         commandBuffer.endRendering();
 
@@ -872,8 +1003,7 @@ private:
         vk::PipelineStageFlags2 dstStageMask
     )
     {
-        vk::ImageMemoryBarrier2 barrier =
-        {
+        vk::ImageMemoryBarrier2 barrier = {
             .srcStageMask        = srcStageMask,
             .srcAccessMask       = srcAccessMask,
             .dstStageMask        = dstStageMask,
@@ -883,8 +1013,7 @@ private:
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image               = this->swapChainImages[imageIndex],
-            .subresourceRange    =
-            {
+            .subresourceRange    = {
                 .aspectMask     = vk::ImageAspectFlagBits::eColor,
                 .baseMipLevel   = 0,
                 .levelCount     = 1,
@@ -893,8 +1022,7 @@ private:
             }
         };
 
-        vk::DependencyInfo dependencyInfo =
-        {
+        vk::DependencyInfo dependencyInfo = {
             .dependencyFlags         = {},
             .imageMemoryBarrierCount = 1,
             .pImageMemoryBarriers    = &barrier
@@ -927,9 +1055,15 @@ private:
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
         // debug messenger
-        if (enableValidationLayers) extensions.push_back(vk::EXTDebugUtilsExtensionName);
+        if (ENABLE_VALIDATION_LAYERS) extensions.push_back(vk::EXTDebugUtilsExtensionName);
 
         return extensions;
+    }
+
+    static void framebufferResizedCallback(GLFWwindow* window, int width, int height)
+    {
+        auto app = reinterpret_cast<VadimApp*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 
     static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(
